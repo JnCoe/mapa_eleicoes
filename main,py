@@ -1,0 +1,153 @@
+# Import libraries
+import pandas as pd
+import numpy as np
+
+# Load CSV file
+file_path = "votacao_secao_2024_RJ.csv"
+df = pd.read_csv(file_path, sep=";", encoding="ISO-8859-1", dtype=str)
+
+# Convert QT_VOTOS to integer
+df["QT_VOTOS"] = df["QT_VOTOS"].astype(int)
+
+# Filter rows where CD_MUNICIPIO (col 14) == 60011
+df_filtered = df[df["CD_MUNICIPIO"] == "60011"]
+
+df_filtered["ID_ENDERECO"] = (
+    df_filtered["NM_LOCAL_VOTACAO"]
+    + ", "
+    + df_filtered["DS_LOCAL_VOTACAO_ENDERECO"]
+    + " / "
+    + df_filtered["DS_CARGO"]
+)
+
+# Create a table with the sum by ID_ENDERECO of QT_VOTOS where NR_VOTAVEL is not 95 or 96
+valid_votes_df = (
+    df_filtered[~df_filtered["NR_VOTAVEL"].isin(["95", "96"])]
+    .groupby("ID_ENDERECO")["QT_VOTOS"]
+    .sum()
+    .reset_index()
+)
+valid_votes_df.rename(columns={"QT_VOTOS": "TOTAL_VOTOS_VALIDOS"}, inplace=True)
+
+# Group by SQ_CANDIDATO (col 24) and ID_ENDERECO
+# and aggregate by summing QT_VOTOS (col 22)
+agg_df = (
+    df_filtered.groupby(["SQ_CANDIDATO", "ID_ENDERECO"])
+    .agg(
+        {
+            "QT_VOTOS": "sum",
+            "NR_VOTAVEL": "first",  # Get any value, since it's the same for all rows with the same SQ_CANDIDATO
+            "NM_VOTAVEL": "first",
+            "DS_LOCAL_VOTACAO_ENDERECO": "first",  # Same for all rows with the same NR_LOCAL_VOTACAO
+            "NM_LOCAL_VOTACAO": "first",
+            "DS_CARGO": "first",
+        }
+    )
+    .reset_index()
+)
+
+# Update DS_LOCAL_VOTACAO_ENDERECO
+agg_df["DS_LOCAL_VOTACAO_ENDERECO"] = (
+    agg_df["DS_LOCAL_VOTACAO_ENDERECO"] + ", Rio de Janeiro - RJ, Brasil"
+)
+
+# Load candidate information from consulta_cand_2024_RJ.csv
+candidate_file_path = "consulta_cand_2024_RJ.csv"
+candidate_df = pd.read_csv(
+    candidate_file_path, sep=";", encoding="ISO-8859-1", dtype=str
+)
+
+# Filter rows where CD_MUNICIPIO == 60011
+candidate_df_filtered = candidate_df[candidate_df["SG_UE"] == "60011"]
+
+# Get distinct values of SQ_CANDIDATO, NM_URNA_CANDIDATO, NR_CANDIDATO, and SG_PARTIDO
+candidate_info_df = candidate_df_filtered[
+    ["SQ_CANDIDATO", "NM_URNA_CANDIDATO", "NR_CANDIDATO", "SG_PARTIDO", "NM_PARTIDO"]
+].drop_duplicates()
+
+# Create VOTAVEL column
+candidate_info_df["VOTAVEL"] = (
+    candidate_info_df["NM_URNA_CANDIDATO"]
+    + " - "
+    + candidate_info_df["NR_CANDIDATO"]
+    + " ("
+    + candidate_info_df["SG_PARTIDO"]
+    + ")"
+)
+
+# Create a separate df with distinct values of NR_PARTIDO and SG_PARTIDO
+partido_info_df = candidate_df_filtered[["NR_PARTIDO", "SG_PARTIDO"]].drop_duplicates()
+partido_info_df["PARTIDO"] = (
+    partido_info_df["NR_PARTIDO"] + " - " + partido_info_df["SG_PARTIDO"]
+)
+partido_info_df = partido_info_df.drop(columns=["SG_PARTIDO"])
+
+# Merge agg_df with candidate_info_df on SQ_CANDIDATO
+agg_df = agg_df.merge(
+    candidate_info_df[["SQ_CANDIDATO", "VOTAVEL"]], on="SQ_CANDIDATO", how="left"
+)
+
+# Left join with partido_info_df by matching the first two characters of NR_VOTAVEL with NR_PARTIDO
+agg_df = agg_df.merge(
+    partido_info_df,
+    left_on=agg_df["NR_VOTAVEL"].str[:2],
+    right_on="NR_PARTIDO",
+    how="left",
+)
+
+# Fill NaN values in VOTAVEL column
+agg_df["VOTAVEL"] = agg_df.apply(
+    lambda row: "BRANCO"
+    if pd.isna(row["VOTAVEL"]) and row["NR_VOTAVEL"] == "95"
+    else (
+        "NULO"
+        if pd.isna(row["VOTAVEL"]) and row["NR_VOTAVEL"] == "96"
+        else (
+            "Legenda: " + str(row["PARTIDO"])
+            if pd.isna(row["VOTAVEL"])
+            else row["VOTAVEL"]
+        )
+    ),
+    axis=1,
+)
+
+# Fill empty PARTIDO values with NM_VOTAVEL
+agg_df["PARTIDO"] = agg_df.apply(
+    lambda row: "BRANCO/NULO"
+    if row["NR_VOTAVEL"] in ["95", "96"]
+    else row["NM_VOTAVEL"]
+    if pd.isna(row["PARTIDO"]) or row["PARTIDO"] == ""
+    else row["PARTIDO"],
+    axis=1,
+)
+
+# Left join with valid_votes_df to add TOTAL_VOTOS_VALIDOS
+agg_df = agg_df.merge(valid_votes_df, on="ID_ENDERECO", how="left")
+
+# Calculate % de votos válidos do local
+agg_df["% de votos válidos do local"] = np.where(
+    agg_df["NR_VOTAVEL"].isin(["95", "96"]),
+    0,
+    round(
+        (agg_df["QT_VOTOS"].astype(float) / agg_df["TOTAL_VOTOS_VALIDOS"].astype(float))
+        * 100,
+        2,
+    ),
+)
+
+# Drop the original NR_VOTAVEL, NM_VOTAVEL, ID_ENDERECO, and TOTAL_VOTOS_VALIDOS columns
+agg_df = agg_df.drop(
+    columns=[
+        "NR_VOTAVEL",
+        "NM_VOTAVEL",
+        "ID_ENDERECO",
+        "TOTAL_VOTOS_VALIDOS",
+        "NR_PARTIDO",
+    ]
+)
+
+# Save the final dataframe to a new CSV file
+output_file_path = "final_output.csv"
+agg_df.to_csv(output_file_path, index=False)
+
+print(f"Final file saved to {output_file_path}")
